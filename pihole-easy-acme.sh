@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  pihole-easy-acme  v1.9
+#  pihole-easy-acme  v2.0
 #  Automated TLS certificate management for Pi-hole via ACME DNS-01 challenge
 #
 #  Copyright (c) 2026 Walter Verkerk (SupaYoshi)
@@ -10,12 +10,12 @@
 set -Eeuo pipefail
 
 # ============================================================
-#  pihole-easy-acme v1.9
+#  pihole-easy-acme v2.0
 #  Simple setup wizard: answer 10 questions, everything works.
 # ============================================================
 
 APP="pihole-easy-acme"
-VERSION="1.9"
+VERSION="2.0"
 CONF_DIR="/etc/${APP}"
 CONF_FILE="${CONF_DIR}/config"
 TOKEN_FILE="${CONF_DIR}/cloudflare.token"
@@ -24,6 +24,7 @@ LOG="/var/log/${APP}.log"
 GRAVITY_LOG="/var/log/pihole-gravity.log"
 LOCK_FILE="/run/${APP}.lock"
 DEFAULT_RENEW_DAYS=30
+MAX_CERT_BACKUPS=5
 CA_PROD="letsencrypt"
 CA_STAGING="letsencrypt_test"
 
@@ -759,6 +760,52 @@ cert_expires_within() {
   openssl x509 -in "$1" -noout -checkend "$(( $2 * 86400 ))" >/dev/null 2>&1 && return 1 || return 0
 }
 
+validate_cert_material() {
+  local cert="$1" key="$2" hostname="$3"
+  [[ -s "$cert" ]] || { warn "Certificate is missing or empty: $cert"; return 1; }
+  [[ -s "$key" ]]  || { warn "Private key is missing or empty: $key"; return 1; }
+
+  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || {
+    warn "Certificate cannot be parsed: $cert"
+    return 1
+  }
+  openssl pkey -in "$key" -noout >/dev/null 2>&1 || {
+    warn "Private key cannot be parsed: $key"
+    return 1
+  }
+  openssl x509 -in "$cert" -noout -checkhost "$hostname" >/dev/null 2>&1 || {
+    warn "Certificate does not cover hostname: $hostname"
+    return 1
+  }
+
+  local cert_pub key_pub
+  cert_pub="$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | sha256sum | awk '{print $1}')"
+  key_pub="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null \
+    | sha256sum | awk '{print $1}')"
+  [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || {
+    warn "Certificate and private key do not match."
+    return 1
+  }
+}
+
+prune_cert_backups() {
+  local pem="$1" keep="${2:-$MAX_CERT_BACKUPS}"
+  local -a backups=()
+  mapfile -t backups < <(find "$(dirname "$pem")" -maxdepth 1 -type f \
+    -name "$(basename "$pem").bak.*" -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | awk '{print $2}')
+
+  local i
+  for ((i=keep; i<${#backups[@]}; i++)); do
+    rm -f -- "${backups[$i]}"
+  done
+  (( ${#backups[@]} > keep )) && \
+    ok "Old certificate backups pruned; newest ${keep} retained."
+  return 0
+}
+
 add_local_dns_records() {
   local domain="$1"
   local custom_list="/etc/pihole/custom.list"
@@ -847,8 +894,10 @@ install_cert_bare() {
   local dir="/root/.acme.sh/${main}_ecc"
   [[ -f "${dir}/fullchain.cer" ]] || die "Fullchain not found: ${dir}/fullchain.cer"
   [[ -f "${dir}/${main}.key" ]]  || die "Key not found: ${dir}/${main}.key"
+  validate_cert_material "${dir}/fullchain.cer" "${dir}/${main}.key" "$primary" \
+    || die "New certificate material failed validation."
 
-  local bak=""
+  local bak="" tmp=""
   if [[ -f /etc/pihole/tls.pem ]]; then
     bak="/etc/pihole/tls.pem.bak.$(date +%F-%H%M%S)"
     cp /etc/pihole/tls.pem "$bak" || die "Backup creation failed"
@@ -856,11 +905,14 @@ install_cert_bare() {
     ok "Backup created: $bak"
   fi
 
-  if ! cat "${dir}/fullchain.cer" "${dir}/${main}.key" > /etc/pihole/tls.pem; then
+  tmp="$(mktemp /etc/pihole/.tls.pem.new.XXXXXX)" || die "Cannot create temporary certificate file"
+  if ! cat "${dir}/fullchain.cer" "${dir}/${main}.key" > "$tmp"; then
+    rm -f -- "$tmp"
     die "Certificate write failed"
   fi
-  chown pihole:pihole /etc/pihole/tls.pem 2>/dev/null || true
-  chmod 600 /etc/pihole/tls.pem
+  chown pihole:pihole "$tmp" 2>/dev/null || true
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" /etc/pihole/tls.pem || die "Atomic certificate install failed"
   ok "Certificate installed: /etc/pihole/tls.pem"
 
   command -v pihole-FTL >/dev/null 2>&1 && {
@@ -868,8 +920,10 @@ install_cert_bare() {
     pihole-FTL --config webserver.tls.cert      "/etc/pihole/tls.pem" >/dev/null 2>&1 || true
   }
 
-  if systemctl restart pihole-FTL >/dev/null 2>&1; then
+  if systemctl restart pihole-FTL >/dev/null 2>&1 \
+      && systemctl is-active --quiet pihole-FTL; then
     ok "pihole-FTL restarted."
+    prune_cert_backups /etc/pihole/tls.pem
   else
     warn "Restart failed — rolling back..."
     if [[ -n "$bak" ]] && [[ -f "$bak" ]]; then
@@ -889,21 +943,26 @@ install_cert_docker() {
   [[ -f "${dir}/${main}.key" ]]  || die "Key not found."
   [[ -n "$host_etc" ]] || die "Host etc path is empty"
   [[ -n "$container" ]] || die "Container name is empty"
+  validate_cert_material "${dir}/fullchain.cer" "${dir}/${main}.key" "$primary" \
+    || die "New certificate material failed validation."
 
   mkdir -p "$host_etc" || die "Cannot create directory: $host_etc"
   chmod 700 "$host_etc"
 
-  local bak=""
+  local bak="" tmp=""
   if [[ -f "$pem" ]]; then
     bak="${pem}.bak.$(date +%F-%H%M%S)"
     cp "$pem" "$bak" || die "Backup creation failed"
     ok "Backup created: $bak"
   fi
 
-  if ! cat "${dir}/fullchain.cer" "${dir}/${main}.key" > "$pem"; then
+  tmp="$(mktemp "${host_etc}/.tls.pem.new.XXXXXX")" || die "Cannot create temporary certificate file"
+  if ! cat "${dir}/fullchain.cer" "${dir}/${main}.key" > "$tmp"; then
+    rm -f -- "$tmp"
     die "Certificate write failed"
   fi
-  chmod 600 "$pem"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$pem" || die "Atomic certificate install failed"
   ok "Certificate installed: $pem"
 
   docker exec "$container" pihole-FTL --config webserver.domain        "$primary"            >/dev/null 2>&1 || true
@@ -911,6 +970,7 @@ install_cert_docker() {
 
   if docker restart "$container" >/dev/null 2>&1; then
     ok "Container restarted: $container"
+    prune_cert_backups "$pem"
   else
     warn "Container restart failed — rolling back..."
     if [[ -n "$bak" ]] && [[ -f "$bak" ]]; then
@@ -922,17 +982,17 @@ install_cert_docker() {
 }
 
 # ============================================================
-#  Cloudflare DNS sync
+#  WAN IP reporting
 # ============================================================
 
-sync_dns() {
+report_wan_ip() {
   [[ "$(cfg_get dns_sync false)" == "true" ]] || return 0
   local zone_id primary
   zone_id="$(cfg_get zone_id)"
   primary="$(cfg_get primary)"
-  [[ -n "$zone_id" ]] && [[ -n "$primary" ]] || { warn "DNS sync: configuration missing."; return 0; }
+  [[ -n "$zone_id" ]] && [[ -n "$primary" ]] || { warn "WAN IP report: configuration missing."; return 0; }
 
-  info "Cloudflare DNS records verifying for: $primary"
+  info "Reporting WAN addresses for: $primary"
   local wan4 wan6
   wan4="$(get_wan_ipv4 || true)"
   wan6="$(get_wan_ipv6 || true)"
@@ -949,12 +1009,20 @@ sync_dns() {
     info "No public IPv6 detected."
   fi
 
-  ok "DNS sync completed (verification only)."
+  ok "WAN IP report completed; no DNS records were changed."
 }
+
+# Backwards-compatible internal name for v1.9 configurations and menu paths.
+sync_dns() { report_wan_ip; }
 
 # ============================================================
 #  Schedulers
 # ============================================================
+
+disable_acme_cron() {
+  [[ -x /root/.acme.sh/acme.sh ]] || return 0
+  /root/.acme.sh/acme.sh --uninstall-cronjob >/dev/null 2>&1 || true
+}
 
 install_timer() {
   local name="$1" desc="$2" cmd="$3" time="$4"
@@ -992,9 +1060,12 @@ install_self() {
 setup_schedulers() {
   command -v systemctl >/dev/null 2>&1 || { warn "systemd not available."; return 0; }
 
-  [[ "$(cfg_get auto_renew false)" == "true" ]] && \
+  if [[ "$(cfg_get auto_renew false)" == "true" ]]; then
     install_timer "${APP}" "Pi-hole Easy ACME renewal" \
       "/usr/local/sbin/${APP} --renew" "*-*-* 03:11:00"
+    disable_acme_cron
+    ok "Native acme.sh cron disabled; systemd owns certificate renewal."
+  fi
 
   if [[ "$(cfg_get auto_gravity false)" == "true" ]]; then
     local when="*-*-* 03:17:00"
@@ -1039,6 +1110,9 @@ do_certificate() {
     need_cert="true"
   else
     ok "Certificate expires in more than ${renew_days} days (expires: $(cert_expiry "$pem"))."
+    disable_acme_cron
+    ok "No renewal or Pi-hole restart required."
+    return 0
   fi
 
   # Request new certificate if needed
@@ -1061,10 +1135,10 @@ do_certificate() {
     echo
     info "Requesting certificate for: ${domains[*]}"
     do_issue "$force" "$ca" "${domains[@]}" || die "acme.sh certificate request failed"
-    /root/.acme.sh/acme.sh --remove-cronjob  >/dev/null 2>&1 || true  # systemd timer handles renewal
+    disable_acme_cron
   fi
 
-  # ALWAYS apply Pi-hole configuration (hostname, TLS paths) regardless of cert renewal
+  # Apply Pi-hole configuration only after a newly issued certificate.
   if [[ "$mode" == "docker" ]]; then
     local host_etc; host_etc="$(docker_etc_pihole "$container" || true)"
     [[ -n "$host_etc" ]] || die "Cannot determine Docker mount path"
@@ -1073,8 +1147,7 @@ do_certificate() {
     install_cert_bare "$primary" "$main_domain"
   fi
 
-  # ALWAYS sync DNS
-  sync_dns
+  report_wan_ip
   echo
   ok "Certificate valid until: $(cert_expiry "$pem")"
   ok "HTTPS reachable at: https://${primary}/admin"
@@ -1302,11 +1375,11 @@ PY
   [[ -n "$EMAIL" ]] || EMAIL="admin@${ZONE_NAME}"
 
   # ─── Step 7: Cloudflare DNS sync ────────────────────────────
-  step 7 "Cloudflare DNS verification"
-  echo "  The script can verify your current WAN IP address."
+  step 7 "WAN IP reporting"
+  echo "  The script can report your current WAN IP address."
   echo "  (This does not create or modify DNS records)"
   echo
-  ask_yesno "Enable DNS verification?" "y" DNS_SYNC
+  ask_yesno "Enable WAN IP reporting?" "y" DNS_SYNC
 
   # ─── Step 8: Staging ────────────────────────────────────────
   step 8 "Let's Encrypt mode"
@@ -1475,7 +1548,7 @@ maintenance_menu() {
     echo
     echo "  1) Renew certificate       (only if expiring soon)"
     echo "  2) Force renew certificate (request new now)"
-    echo "  3) Verify Cloudflare DNS"
+    echo "  3) Report WAN IP addresses"
     echo "  4) Update Pi-hole          (pihole -up)"
     echo "  5) Run gravity now         (refresh adlists)"
     echo "  6) Show status"
@@ -1580,7 +1653,8 @@ maintenance_menu() {
 auto_renew() {
   as_root; lock; ensure_dirs; read_token
   need_cmd openssl; need_cmd python3; need_cmd curl
-  do_certificate "false" || warn "Renewal failed."
+  disable_acme_cron
+  do_certificate "false"
 }
 
 auto_gravity() {
