@@ -1,0 +1,1 @@
+zabbix ALL=(root) NOPASSWD: /usr/local/sbin/openclaw-zbx-pihole-easy-acme *

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ctid="${1:-}"
+check="${2:-}"
+hostname="${3:-}"
+connect_host="${4:-}"
+cert_file="${5:-/etc/pihole/tls.pem}"
+
+if [[ -z "$ctid" || -z "$check" ]]; then
+  echo "usage: $0 <ctid> <check> [hostname] [connect_host] [cert_file]" >&2
+  exit 1
+fi
+
+pct_exec() {
+  pct exec "$ctid" -- "$@"
+}
+
+systemd_bool() {
+  local op="$1" unit="$2" expected="$3"
+  if pct_exec systemctl "$op" "$unit" 2>/dev/null | grep -qx "$expected"; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+service_failed() {
+  if pct_exec systemctl is-failed pihole-easy-acme.service 2>/dev/null | grep -qx failed; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+journal_errors_24h() {
+  pct_exec journalctl -u pihole-easy-acme.service --since "24 hours ago" --no-pager 2>/dev/null \
+    | grep -Eci 'failed|failure|error|invalid|unauthori[sz]ed|timeout|challenge.*(fail|invalid)|certificate.*(fail|invalid)' || true
+}
+
+cert_end_epoch() {
+  local source="$1" end
+  end="$(awk 'BEGIN{found=0} /-----BEGIN CERTIFICATE-----/{found=1} found{print} /-----END CERTIFICATE-----/{exit}' "$source" \
+    | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+  date -u -d "$end" +%s
+}
+
+installed_days_left() {
+  local now end tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+  pct_exec sh -c "awk 'BEGIN{found=0} /-----BEGIN CERTIFICATE-----/{found=1} found{print} /-----END CERTIFICATE-----/{exit}' '$cert_file'" >"$tmp"
+  end="$(cert_end_epoch "$tmp")"
+  now="$(date -u +%s)"
+  echo $(( (end - now) / 86400 ))
+}
+
+served_cert() {
+  if [[ -z "$hostname" || -z "$connect_host" ]]; then
+    echo "hostname and connect_host are required for served certificate checks" >&2
+    exit 1
+  fi
+  timeout 10 openssl s_client -connect "${connect_host}:443" -servername "$hostname" </dev/null 2>/dev/null \
+    | awk 'BEGIN{found=0} /-----BEGIN CERTIFICATE-----/{found=1} found{print} /-----END CERTIFICATE-----/{exit}'
+}
+
+served_days_left() {
+  local now end tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+  served_cert >"$tmp"
+  end="$(cert_end_epoch "$tmp")"
+  now="$(date -u +%s)"
+  echo $(( (end - now) / 86400 ))
+}
+
+served_san_match() {
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+  served_cert >"$tmp"
+  if openssl x509 -in "$tmp" -noout -ext subjectAltName 2>/dev/null \
+      | grep -Eq "(DNS:${hostname})(,|$|[[:space:]])"; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+served_installed_fingerprint_match() {
+  local served installed
+  served="$(served_cert | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')"
+  installed="$(pct_exec sh -c "awk 'BEGIN{found=0} /-----BEGIN CERTIFICATE-----/{found=1} found{print} /-----END CERTIFICATE-----/{exit}' '$cert_file' | openssl x509 -noout -fingerprint -sha256" 2>/dev/null | sed 's/^.*=//')"
+  if [[ -n "$served" && "$served" == "$installed" ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+last_success_age() {
+  local line epoch now
+  line="$(pct_exec journalctl -u pihole-easy-acme.service --since "60 days ago" --no-pager -o short-iso 2>/dev/null \
+    | grep -E 'Certificate valid until:|HTTPS reachable at:' | tail -1 || true)"
+  if [[ -z "$line" ]]; then
+    echo -1
+    return
+  fi
+  epoch="$(date -u -d "${line%% *}" +%s 2>/dev/null || echo 0)"
+  now="$(date -u +%s)"
+  if [[ "$epoch" -gt 0 ]]; then
+    echo $(( now - epoch ))
+  else
+    echo -1
+  fi
+}
+
+case "$check" in
+  timer_active) systemd_bool is-active pihole-easy-acme.timer active ;;
+  timer_enabled) systemd_bool is-enabled pihole-easy-acme.timer enabled ;;
+  service_failed) service_failed ;;
+  journal_errors_24h) journal_errors_24h ;;
+  installed_days_left) installed_days_left ;;
+  served_days_left) served_days_left ;;
+  served_san_match) served_san_match ;;
+  served_installed_fingerprint_match) served_installed_fingerprint_match ;;
+  last_success_age) last_success_age ;;
+  *) echo "unsupported check: $check" >&2; exit 1 ;;
+esac

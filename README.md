@@ -1,4 +1,4 @@
-# Pi-hole Easy Encrypt
+# Pi-hole Easy ACME
 
 Automated HTTPS setup for your Pi-hole dashboard using Let's Encrypt and Cloudflare DNS validation.
 
@@ -54,3 +54,46 @@ Cloudflare A/AAAA records.
   - Zone → Zone → Read
 
 Required binaries:
+- `bash`
+- `curl`
+- `openssl`
+- `systemctl`
+- `python3`
+- `acme.sh`
+- `pihole` / Pi-hole FTL tooling
+
+---
+
+## Install
+
+```bash
+sudo install -m 0755 pihole-easy-acme.sh /usr/local/sbin/pihole-easy-acme
+sudo pihole-easy-acme
+```
+
+The setup wizard writes its configuration under `/etc/pihole-easy-acme/` and
+creates `pihole-easy-acme.service` plus `pihole-easy-acme.timer`.
+
+---
+
+## Zabbix Monitoring
+
+Optional Zabbix Agent 2 UserParameter monitoring is included under
+`monitoring/zabbix/`.
+
+It can monitor:
+- `pihole-easy-acme.timer` active/enabled state.
+- `pihole-easy-acme.service` failed state.
+- served TLS certificate days remaining.
+- served certificate SAN match for the expected hostname.
+- served-vs-installed `/etc/pihole/tls.pem` SHA256 fingerprint match.
+- repeated ACME-related journal errors.
+- age of the last successful renewal/check.
+
+See `docs/zabbix-monitoring.md` for deployment details and example item keys.
+
+---
+
+## Changelog
+
+See `CHANGELOG.md`.
