@@ -103,7 +103,7 @@ served_installed_fingerprint_match() {
 last_success_age() {
   local line epoch now
   line="$(pct_exec journalctl -u pihole-easy-acme.service --since "60 days ago" --no-pager -o short-iso 2>/dev/null \
-    | grep -E 'Certificate valid until:|HTTPS reachable at:' | tail -1 || true)"
+    | grep -E 'Certificate valid until:|HTTPS reachable at:|No renewal or Pi-hole restart required[.]' | tail -1 || true)"
   if [[ -z "$line" ]]; then
     echo -1
     return

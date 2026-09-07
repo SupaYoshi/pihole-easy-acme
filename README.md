@@ -29,7 +29,7 @@ Currently supported DNS provider:
 
 ## Renewal safety
 
-Version 2.0 uses one renewal scheduler: `pihole-easy-acme.timer`. The native
+Version 2.1 uses one renewal scheduler: `pihole-easy-acme.timer`. The native
 `acme.sh` cron entry is removed when the timer is configured and on each
 scheduled check.
 
@@ -38,6 +38,13 @@ certificate remains valid beyond the configured renewal window. When renewal
 is required, the new certificate, private key and hostname are validated
 before an atomic install. Pi-hole FTL is restarted once and the current
 certificate is restored if the restart fails.
+
+ACME program, account state and certificate storage now have explicit paths.
+Renewal-skip exit 2 succeeds only with validated material, and identical
+material is never reinstalled. Read the [state configuration and recovery
+guide](docs/acme-state.md) before upgrading an installation with split state
+(e.g. historical `/.acme.sh` data). It also documents the offline regression
+suite and its limits.
 
 The `dns_sync` configuration key is retained for compatibility with v1.9, but
 it only enables a read-only WAN IP report. It does not create or modify
