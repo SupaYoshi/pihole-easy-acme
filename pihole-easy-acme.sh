@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  pihole-easy-acme  v2.0
+#  pihole-easy-acme  v2.1
 #  Automated TLS certificate management for Pi-hole via ACME DNS-01 challenge
 #
 #  Copyright (c) 2026 Walter Verkerk (SupaYoshi)
@@ -10,12 +10,12 @@
 set -Eeuo pipefail
 
 # ============================================================
-#  pihole-easy-acme v2.0
+#  pihole-easy-acme v2.1
 #  Simple setup wizard: answer 10 questions, everything works.
 # ============================================================
 
 APP="pihole-easy-acme"
-VERSION="2.0"
+VERSION="2.1"
 CONF_DIR="/etc/${APP}"
 CONF_FILE="${CONF_DIR}/config"
 TOKEN_FILE="${CONF_DIR}/cloudflare.token"
@@ -773,6 +773,19 @@ validate_cert_material() {
     warn "Private key cannot be parsed: $key"
     return 1
   }
+  openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null 2>&1 || {
+    warn "Certificate expires within 24 hours."
+    return 1
+  }
+  local start now
+  start="$(openssl x509 -in "$cert" -noout -startdate 2>/dev/null)" || return 1
+  start="$(date -u -d "${start#notBefore=}" +%s 2>/dev/null)" || return 1
+  now="$(date -u +%s)"
+  (( start <= now )) || { warn "Certificate is not yet valid."; return 1; }
+  openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:' || {
+    warn "Certificate has no DNS subjectAltName."
+    return 1
+  }
   openssl x509 -in "$cert" -noout -checkhost "$hostname" >/dev/null 2>&1 || {
     warn "Certificate does not cover hostname: $hostname"
     return 1
@@ -841,11 +854,44 @@ add_local_dns_records() {
 #  acme.sh + certificaat installatie
 # ============================================================
 
+# Never infer account/certificate state from the invoking shell's HOME.
+# Legacy split state is detected, not silently moved or selected.
+resolve_acme_paths() {
+  ACME_HOME="$(cfg_get acme_home /root/.acme.sh)"
+  ACME_CONFIG_HOME="$(cfg_get acme_config_home "$ACME_HOME")"
+  ACME_CERT_HOME="$(cfg_get acme_cert_home "$ACME_CONFIG_HOME")"
+  local path
+  for path in "$ACME_HOME" "$ACME_CONFIG_HOME" "$ACME_CERT_HOME"; do
+    [[ "$path" == /* && "$path" != / && "$path" != *$'\n'* ]] || {
+      warn "ACME paths must be absolute non-root directories."
+      return 1
+    }
+  done
+  if [[ -z "$(cfg_get acme_config_home)" && -z "$(cfg_get acme_cert_home)" \
+        && "$ACME_HOME" != /.acme.sh && -d /.acme.sh ]]; then
+    warn "Legacy /.acme.sh state detected. Set acme_config_home and acme_cert_home explicitly before renewal; no state has been moved."
+    return 1
+  fi
+}
+
+acme_command() {
+  "$ACME_HOME/acme.sh" --home "$ACME_HOME" \
+    --config-home "$ACME_CONFIG_HOME" --cert-home "$ACME_CERT_HOME" "$@"
+}
+
 install_acme() {
-  [[ -x "/root/.acme.sh/acme.sh" ]] && return 0
+  resolve_acme_paths || return 1
+  [[ -x "$ACME_HOME/acme.sh" ]] && return 0
+  # Preserve the existing bootstrap for standard installations only.
+  [[ "$ACME_HOME" == /root/.acme.sh && "$ACME_CONFIG_HOME" == "$ACME_HOME" \
+      && "$ACME_CERT_HOME" == "$ACME_HOME" ]] || {
+    warn "Install acme.sh in the configured home before continuing."
+    return 1
+  }
   info "Installing acme.sh..."
   local email; email="$(cfg_get email "admin@$(cfg_get zone)")"
-  curl -fsSL https://get.acme.sh | sh -s email="$email" >/dev/null 2>&1
+  curl -fsSL https://get.acme.sh | sh -s email="$email" >/dev/null 2>&1 || return 1
+  [[ -x "$ACME_HOME/acme.sh" ]] || return 1
   ok "acme.sh installed."
 }
 
@@ -853,49 +899,51 @@ do_issue() {
   local force="$1"; shift
   local ca="$1"; shift; local domains=("$@")
   [[ ${#domains[@]} -gt 0 ]] || { warn "No domains specified"; return 1; }
-  export CF_Token="${CF_TOKEN}"
+  resolve_acme_paths || return 1
   local args=(--issue --dns dns_cf --keylength ec-256 --server "$ca")
-
-  # Add force flag if requested
   [[ "$force" == "true" ]] && args+=(--force)
-
+  local d
   for d in "${domains[@]}"; do
-    [[ -n "$d" ]] && args+=(-d "$d")
+    [[ -n "$d" && "$d" != */* && "$d" != -* ]] || return 1
+    args+=(-d "$d")
   done
 
-  # Try to issue the certificate
-  local output
-  output="$(/root/.acme.sh/acme.sh "${args[@]}" 2>&1)"
-  local exit_code=$?
-
-  # Show acme.sh output for debugging
-  if [[ -n "$output" ]]; then
-    echo "$output"
+  # Capture status explicitly: callers may enable errexit or invoke us in ||.
+  # Do not echo raw provider output, which can contain sensitive account data.
+  local exit_code=0
+  CF_Token="${CF_TOKEN}" acme_command "${args[@]}" >/dev/null 2>&1 || exit_code=$?
+  case "$exit_code" in
+    0|2) ;;
+    *) warn "acme.sh failed (exit ${exit_code}); certificate not installed."; return "$exit_code" ;;
+  esac
+  local main="${domains[0]}" dir="${ACME_CERT_HOME}/${domains[0]}_ecc"
+  for d in "${domains[@]}"; do
+    validate_cert_material "${dir}/fullchain.cer" "${dir}/${main}.key" "$d" || return 1
+  done
+  if (( exit_code == 2 )); then
+    ok "ACME renewal skipped; existing certificate material validated."
   fi
+  ok "Certificate ready: ${main}"
+}
 
-  # Check exit code
-  if [[ $exit_code -eq 0 ]]; then
-    local main="${domains[0]}"
-    local dir="/root/.acme.sh/${main}_ecc"
-    if [[ -f "${dir}/fullchain.cer" ]] && [[ -f "${dir}/${main}.key" ]]; then
-      ok "Certificate ready: ${main}"
-      return 0
-    else
-      warn "Certificate files not found after acme.sh reported success"
-      return 1
-    fi
-  else
-    return $exit_code
-  fi
+cert_material_unchanged() {
+  local cert="$1" key="$2" pem="$3"
+  [[ -s "$pem" ]] && cmp -s "$pem" <(cat "$cert" "$key")
 }
 
 install_cert_bare() {
   local primary="$1" main="$2"
-  local dir="/root/.acme.sh/${main}_ecc"
+  resolve_acme_paths || die "Cannot resolve ACME state."
+  local dir="${ACME_CERT_HOME}/${main}_ecc"
   [[ -f "${dir}/fullchain.cer" ]] || die "Fullchain not found: ${dir}/fullchain.cer"
   [[ -f "${dir}/${main}.key" ]]  || die "Key not found: ${dir}/${main}.key"
   validate_cert_material "${dir}/fullchain.cer" "${dir}/${main}.key" "$primary" \
     || die "New certificate material failed validation."
+
+  if cert_material_unchanged "${dir}/fullchain.cer" "${dir}/${main}.key" /etc/pihole/tls.pem; then
+    ok "No renewal or Pi-hole restart required."
+    return 0
+  fi
 
   local bak="" tmp=""
   if [[ -f /etc/pihole/tls.pem ]]; then
@@ -936,7 +984,8 @@ install_cert_bare() {
 
 install_cert_docker() {
   local container="$1" primary="$2" main="$3" host_etc="$4"
-  local dir="/root/.acme.sh/${main}_ecc"
+  resolve_acme_paths || die "Cannot resolve ACME state."
+  local dir="${ACME_CERT_HOME}/${main}_ecc"
   local pem="${host_etc}/tls.pem"
 
   [[ -f "${dir}/fullchain.cer" ]] || die "Fullchain not found."
@@ -945,6 +994,11 @@ install_cert_docker() {
   [[ -n "$container" ]] || die "Container name is empty"
   validate_cert_material "${dir}/fullchain.cer" "${dir}/${main}.key" "$primary" \
     || die "New certificate material failed validation."
+
+  if cert_material_unchanged "${dir}/fullchain.cer" "${dir}/${main}.key" "$pem"; then
+    ok "No renewal or Pi-hole restart required."
+    return 0
+  fi
 
   mkdir -p "$host_etc" || die "Cannot create directory: $host_etc"
   chmod 700 "$host_etc"
@@ -1020,8 +1074,9 @@ sync_dns() { report_wan_ip; }
 # ============================================================
 
 disable_acme_cron() {
-  [[ -x /root/.acme.sh/acme.sh ]] || return 0
-  /root/.acme.sh/acme.sh --uninstall-cronjob >/dev/null 2>&1 || true
+  resolve_acme_paths || return 1
+  [[ -x "$ACME_HOME/acme.sh" ]] || return 0
+  acme_command --uninstall-cronjob >/dev/null 2>&1 || true
 }
 
 install_timer() {
@@ -1106,7 +1161,8 @@ do_certificate() {
 
   # Determine if we need to request a new certificate
   local need_cert="false"
-  if [[ "$force" == "true" ]] || cert_expires_within "$pem" "$renew_days"; then
+  if [[ "$force" == "true" ]] || cert_expires_within "$pem" "$renew_days" \
+      || ! validate_cert_material "$pem" "$pem" "$primary"; then
     need_cert="true"
   else
     ok "Certificate expires in more than ${renew_days} days (expires: $(cert_expiry "$pem"))."
@@ -1131,7 +1187,7 @@ do_certificate() {
     local ca="$CA_PROD"
     [[ "$staging" == "true" ]] && ca="$CA_STAGING"
 
-    install_acme
+    install_acme || die "ACME installation/state configuration failed."
     echo
     info "Requesting certificate for: ${domains[*]}"
     do_issue "$force" "$ca" "${domains[@]}" || die "acme.sh certificate request failed"
