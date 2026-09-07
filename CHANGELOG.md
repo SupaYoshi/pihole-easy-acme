@@ -10,6 +10,8 @@
   genuine errors and suppress raw provider output in wrapper logs.
 - Require valid dates, more than 24 hours remaining, DNS SAN coverage and
   matching certificate/key material for issuance and installation.
+- Require an explicit positive OpenSSL hostname result; older versions return
+  exit 0 even when the hostname does not match.
 - Avoid writes, backups and restarts for identical installed material on both
   bare-metal and Docker paths; validate the renewal-window fast path too.
 - Count successful no-renewal checks in Zabbix last-success monitoring.

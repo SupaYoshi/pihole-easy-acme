@@ -786,7 +786,11 @@ validate_cert_material() {
     warn "Certificate has no DNS subjectAltName."
     return 1
   }
-  openssl x509 -in "$cert" -noout -checkhost "$hostname" >/dev/null 2>&1 || {
+  # Older OpenSSL versions return exit 0 even for a hostname mismatch.
+  # Require the positive match text as well as a successful command.
+  local host_check
+  host_check="$(LC_ALL=C openssl x509 -in "$cert" -noout -checkhost "$hostname" 2>/dev/null)" || return 1
+  [[ "$host_check" == "Hostname ${hostname} does match certificate" ]] || {
     warn "Certificate does not cover hostname: $hostname"
     return 1
   }
